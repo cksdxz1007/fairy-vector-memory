@@ -30,6 +30,7 @@ SECRET_PATTERNS = [
     (r'(Bearer\s+[a-zA-Z0-9_\-\.]+)', '[BEARER_TOKEN]'),
     (r'\beyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\b', '[JWT_TOKEN]'),
     (r'\b(AKIA[0-9A-Z]{16})\b', '[AWS_KEY]'),
+    (r'\b(\d{8,10}:[a-zA-Z0-9_-]{35})\b', '[TELEGRAM_BOT_TOKEN]'),
     (r'\b([a-z]{4}\s+[a-z]{4}\s+[a-z]{4}\s+[a-z]{4})\b', '[Gmail_App_Password]'),
     (r'\b([a-zA-Z0-9]{32,})\b', '[SECRET_KEY]'),
     (r'[a-zA-Z0-9_.+-]+:[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[URL_WITH_CRED]'),
@@ -42,11 +43,15 @@ def sanitize(text):
         text = pattern.sub(replacement, text)
     return text
 
-# ====== 读取上次检查时间 ======
+# ====== 读取 state（last_check + seen 持久化） ======
 if STATE_FILE.exists():
     state = json.loads(STATE_FILE.read_text())
 else:
     state = {"last_check": ""}
+
+# 持久化的 seen 集合（跨运行去重）
+persistent_seen = set(state.get("seen_hashes", []))
+
 last_check_str = state.get("last_check", "")
 if last_check_str:
     last_check_str_clean = last_check_str.replace("Z", "").replace("+00:00", "").replace("+08:00", "").rstrip()
@@ -63,11 +68,12 @@ print(f"[fairy-memory-update] 上次检查: {last_check.strftime('%Y-%m-%d %H:%M
 if not MEMORY_FILE.exists():
     print(f"[fairy-memory-update] memory 文件不存在，跳过: {MEMORY_FILE.name}")
     new_entries = []
+    seen = set(persistent_seen)
 else:
     current_memory = MEMORY_FILE.read_text()
 
-    # ====== 预加载已有 memory 文件中的内容哈希，防止重复追加 ======
-    seen = set()
+    # ====== 预加载已有 memory 文件内容哈希 + 持久化 seen（跨运行去重） ======
+    seen = set(persistent_seen)  # 先加载跨运行的持久化哈希
     for line in current_memory.split('\n'):
         # 匹配 "- [HH:MM] 主人：" 格式，提取正文
         m = re.match(r'^-\s+\[\d{2}:\d{2}\]\s+主人[：:]\s*(.*)$', line)
@@ -168,6 +174,13 @@ else:
                             continue
                         if re.match(r'^---+$', actual_text.strip()):
                             continue
+                        # 过滤 cron job 自身的输出（不应进入 memory）
+                        if actual_text.startswith('/approve '):
+                            continue
+                        if 'Exec finished (gateway id=' in actual_text and ', code ' in actual_text:
+                            continue
+                        if actual_text.startswith('[fairy-memory-update]'):
+                            continue
                         actual_text = re.sub(r'^MEDIA:.*?(?=\s|$)', '', actual_text, flags=re.DOTALL).strip()
 
                         # 脱敏
@@ -240,8 +253,13 @@ else:
     else:
         print(f"[fairy-memory-update] 没有新内容，跳过")
 
-# ====== 更新 last_check ======
-state["last_check"] = datetime.now(TZ).isoformat().replace("+08:00", "").replace("Z", "")
-state["note"] = "由 fairy-memory-update 自动更新（多session聚合版 + 通用脱敏）"
-STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+# ====== 更新 last_check 和 seen_hashes ======
+# 合并本次运行新出现的哈希到 persistent_seen 并持久化
+all_seen = persistent_seen | seen
+final_state = {
+    "last_check": datetime.now(TZ).isoformat().replace("+08:00", "").replace("Z", ""),
+    "seen_hashes": list(all_seen),
+    "note": "由 fairy-memory-update 自动更新（多session聚合版 + 通用脱敏 + seen持久化）",
+}
+STATE_FILE.write_text(json.dumps(final_state, indent=2, ensure_ascii=False))
 print(f"[fairy-memory-update] last_check 已更新: {state['last_check']}")
